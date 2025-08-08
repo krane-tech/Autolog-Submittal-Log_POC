@@ -6,9 +6,8 @@ A production-ready tool for extracting submittal requirements from construction 
 
 ### **High-Level Overview**
 
-<function_calls>
-<invoke name="create_diagram">
-<parameter name="content">graph TD
+```mermaid
+graph TD
     A["📄 Input PDF<br/>(Specification Document)"] --> B["📊 Document Analysis<br/>(Page count, token estimation)"]
     
     B --> C{"🤔 Needs Splitting?<br/>(> 100K tokens)"}
@@ -52,6 +51,7 @@ A production-ready tool for extracting submittal requirements from construction 
     style O fill:#f3e5f5
     style P fill:#f3e5f5
     style Q fill:#f3e5f5
+```
 
 ## 🔄 **Processing Flow Explained**
 
