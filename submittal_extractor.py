@@ -11,6 +11,7 @@ import logging
 
 from gemini_extractor import GeminiExtractor, ExtractionError
 from pdf_splitter import PDFSplitter, merge_extraction_results
+from parallel_processor import ParallelChunkProcessor
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -46,6 +47,7 @@ class SubmittalExtractor:
         try:
             self.extractor = GeminiExtractor(api_key=api_key)
             self.pdf_splitter = PDFSplitter(max_tokens_per_chunk=100_000)
+            self.parallel_processor = ParallelChunkProcessor(self.extractor, max_retries=3)
             logger.info("✅ GeminiExtractor initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize GeminiExtractor: {e}")
@@ -113,72 +115,61 @@ class SubmittalExtractor:
         return results
     
     def _extract_with_pdf_splitting(self, pdf_path: Path, splitting_plan: Dict) -> Dict:
-        """Process large PDF by splitting into smaller chunks."""
+        """Process large PDF using parallel splitting approach."""
         chunks = splitting_plan["chunks"]
         
-        logger.info(f"📊 Large PDF detected - using splitting strategy:")
+        logger.info(f"📊 Large PDF detected - using PARALLEL splitting strategy:")
         logger.info(f"   • Total pages: {splitting_plan['total_pages']}")
         logger.info(f"   • Estimated tokens: {splitting_plan['estimated_tokens']:,}")
         logger.info(f"   • Number of chunks: {splitting_plan['num_chunks']}")
         logger.info(f"   • Estimated cost: ${splitting_plan['estimated_cost']:.6f}")
+        logger.info(f"   🚀 Processing ALL chunks simultaneously!")
         
         # Split PDF into smaller files
         chunk_files = self.pdf_splitter.split_pdf(str(pdf_path), chunks)
         
-        chunk_results = []
+        # Process all chunks in parallel with smart retry
+        parallel_result = self.parallel_processor.process_with_smart_retry(chunk_files)
         
-        for i, chunk_file in enumerate(chunk_files, 1):
-            try:
-                chunk_info = chunks[i-1]  # (start_page, end_page)
-                start_page, end_page = chunk_info
-                
-                logger.info(f"📋 Processing chunk {i}/{len(chunk_files)}: Pages {start_page}-{end_page}")
-                
-                # Extract from this chunk PDF
-                result = self.extractor.extract(chunk_file)
-                
-                # Convert to dict format for merging
-                chunk_data = {
-                    "bullets": result.data.get("bullets", []),
-                    "metadata": {
-                        "model_used": result.model_used,
-                        "processing_time_seconds": result.processing_time,
-                        "timestamp": result.timestamp,
-                        "token_usage": result.token_usage.dict(),
-                        "chunk_info": {
-                            "chunk_number": i,
-                            "total_chunks": len(chunk_files),
-                            "start_page": start_page,
-                            "end_page": end_page,
-                            "chunk_file": Path(chunk_file).name
-                        }
-                    }
-                }
-                
-                chunk_results.append(chunk_data)
-                
-                bullets_count = len(result.data.get('bullets', []))
-                cost = result.token_usage.total_cost
-                logger.info(f"   ✅ Chunk {i} completed: {bullets_count} bullets, ${cost:.6f}")
-                
-            except Exception as e:
-                logger.error(f"❌ Chunk {i} failed: {e}")
-                # Continue with other chunks rather than failing completely
-                continue
+        # Check if any chunks permanently failed
+        if parallel_result.failed_chunks:
+            failed_count = len(parallel_result.failed_chunks)
+            total_count = parallel_result.total_chunks
+            logger.warning(f"⚠️ {failed_count}/{total_count} chunks permanently failed after {self.parallel_processor.max_retries} retries")
+            logger.warning(f"   Failed chunks: {parallel_result.failed_chunks}")
+            logger.info(f"   Proceeding with {len(parallel_result.successful_results)} successful chunks")
         
-        if not chunk_results:
+        if not parallel_result.successful_results:
             raise ExtractionError("All PDF chunks failed to process")
+        
+        # Convert parallel results to the format expected by merge function
+        chunk_results = [result.data for result in parallel_result.successful_results]
         
         # Merge all chunk results
         logger.info(f"🔗 Merging results from {len(chunk_results)} successful chunks...")
         merged_results = merge_extraction_results(chunk_results)
         
+        # Add parallel processing statistics to metadata
+        merged_metadata = merged_results.get('metadata', {})
+        merged_metadata.update({
+            "parallel_processing": {
+                "total_chunks": parallel_result.total_chunks,
+                "successful_chunks": len(parallel_result.successful_results),
+                "failed_chunks": len(parallel_result.failed_chunks),
+                "total_retries": parallel_result.total_retries,
+                "parallel_processing_time": parallel_result.total_processing_time
+            }
+        })
+        merged_results['metadata'] = merged_metadata
+        
         total_bullets = len(merged_results.get('bullets', []))
         total_cost = merged_results.get('metadata', {}).get('token_usage', {}).get('total_cost', 0)
+        parallel_time = parallel_result.total_processing_time
         
-        logger.info(f"✅ PDF splitting extraction completed")
+        logger.info(f"✅ Parallel PDF splitting extraction completed in {parallel_time:.1f}s")
         logger.info(f"📊 Final result: {total_bullets} unique submittal items")
         logger.info(f"💰 Total cost: ${total_cost:.6f}")
+        logger.info(f"🔄 Total retry operations: {parallel_result.total_retries}")
         
         return merged_results
     
